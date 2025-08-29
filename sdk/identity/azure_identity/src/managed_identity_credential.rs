@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::{
-    env::Env, AppServiceManagedIdentityCredential, ImdsId, TokenCredentialOptions,
-    VirtualMachineManagedIdentityCredential,
+    env::Env, AppServiceManagedIdentityCredential, AzureArcManagedIdentityCredential, ImdsId, 
+    TokenCredentialOptions, VirtualMachineManagedIdentityCredential,
 };
 use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
 use std::sync::Arc;
@@ -61,6 +61,9 @@ impl ManagedIdentityCredential {
                     ));
                 }
                 AppServiceManagedIdentityCredential::new(id, options.credential_options)?
+            }
+            ManagedIdentitySource::AzureArc => {
+                AzureArcManagedIdentityCredential::new(id, options.credential_options)?
             }
             ManagedIdentitySource::Imds => {
                 VirtualMachineManagedIdentityCredential::new(id, options.credential_options)?
@@ -130,13 +133,14 @@ const MSI_SECRET: &str = "MSI_SECRET";
 fn get_source(env: &Env) -> ManagedIdentitySource {
     use ManagedIdentitySource::*;
     if env.var(IDENTITY_ENDPOINT).is_ok() {
-        if env.var(IDENTITY_HEADER).is_ok() {
+        if env.var(IMDS_ENDPOINT).is_ok() {
+            // Azure Arc has both IDENTITY_ENDPOINT and IMDS_ENDPOINT
+            return AzureArc;
+        } else if env.var(IDENTITY_HEADER).is_ok() {
             if env.var(IDENTITY_SERVER_THUMBPRINT).is_ok() {
                 return ServiceFabric;
             }
             return AppService;
-        } else if env.var(IMDS_ENDPOINT).is_ok() {
-            return AzureArc;
         }
     } else if env.var(MSI_ENDPOINT).is_ok() {
         if env.var(MSI_SECRET).is_ok() {
@@ -388,17 +392,91 @@ mod tests {
         );
     }
 
-    #[test]
-    fn arc() {
-        run_unsupported_source_test(
+    async fn run_arc_test(options: Option<ManagedIdentityCredentialOptions>) {
+        let endpoint = "http://localhost/metadata/identity/oauth2/token";
+        let imds_endpoint = "http://localhost/metadata/imds";
+        let arc_secret = "arc-secret-header";
+        let mut model = Request::new(endpoint.parse().unwrap(), Method::Get);
+        model.insert_header("metadata", "true");
+        model.insert_header("authorization", arc_secret);
+
+        let mut params = Vec::from([
+            ("api-version", "2019-11-01"),
+            ("resource", LIVE_TEST_RESOURCE),
+        ]);
+        if let Some(options) = options.as_ref() {
+            if let Some(ref id) = options.user_assigned_id {
+                match id {
+                    UserAssignedId::ClientId(client_id) => {
+                        params.push(("client_id", client_id));
+                    }
+                    UserAssignedId::ObjectId(object_id) => {
+                        params.push(("object_id", object_id));
+                    }
+                    UserAssignedId::ResourceId(resource_id) => {
+                        params.push(("msi_res_id", resource_id));
+                    }
+                }
+            }
+        }
+        model.url_mut().query_pairs_mut().extend_pairs(params);
+
+        run_supported_source_test(
             Env::from(
                 &[
-                    (IDENTITY_ENDPOINT, "http://localhost"),
-                    (IMDS_ENDPOINT, "..."),
+                    (IDENTITY_ENDPOINT, endpoint),
+                    (IMDS_ENDPOINT, imds_endpoint),
+                    (IDENTITY_HEADER, arc_secret),
                 ][..],
             ),
+            options,
             ManagedIdentitySource::AzureArc,
-        );
+            model,
+            format!(
+                r#"{{"access_token":"*","expires_on":"{}","resource":"{}","token_type":"Bearer"}}"#,
+                EXPIRES_ON, LIVE_TEST_RESOURCE
+            )
+            .to_string(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
+    async fn azure_arc() {
+        run_arc_test(None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
+    async fn azure_arc_client_id() {
+        run_arc_test(Some(ManagedIdentityCredentialOptions {
+            user_assigned_id: Some(UserAssignedId::ClientId("expected client ID".to_string())),
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
+    async fn azure_arc_object_id() {
+        run_arc_test(Some(ManagedIdentityCredentialOptions {
+            user_assigned_id: Some(UserAssignedId::ObjectId("expected object ID".to_string())),
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
+    async fn azure_arc_resource_id() {
+        run_arc_test(Some(ManagedIdentityCredentialOptions {
+            user_assigned_id: Some(UserAssignedId::ResourceId(
+                "expected resource ID".to_string(),
+            )),
+            ..Default::default()
+        }))
+        .await;
     }
 
     #[test]
