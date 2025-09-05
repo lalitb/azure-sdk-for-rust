@@ -132,11 +132,12 @@ const MSI_SECRET: &str = "MSI_SECRET";
 
 fn get_source(env: &Env) -> ManagedIdentitySource {
     use ManagedIdentitySource::*;
+    // Azure Arc: presence of IMDS_ENDPOINT is sufficient (IDENTITY_ENDPOINT optional)
+    if env.var(IMDS_ENDPOINT).is_ok() {
+        return AzureArc;
+    }
     if env.var(IDENTITY_ENDPOINT).is_ok() {
-        if env.var(IMDS_ENDPOINT).is_ok() {
-            // Azure Arc has both IDENTITY_ENDPOINT and IMDS_ENDPOINT
-            return AzureArc;
-        } else if env.var(IDENTITY_HEADER).is_ok() {
+        if env.var(IDENTITY_HEADER).is_ok() {
             if env.var(IDENTITY_SERVER_THUMBPRINT).is_ok() {
                 return ServiceFabric;
             }
@@ -442,42 +443,97 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
-    async fn azure_arc() {
-        run_arc_test(None).await;
-    }
+    async fn azure_arc_detection_imds_only() {
+        use azure_core::{
+            http::{
+                headers::{HeaderName, Headers},
+                Method, RawResponse, StatusCode, Url, Request as CoreRequest
+            },
+            Bytes
+        };
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempfile::NamedTempFile;
+        use azure_core_test::http::MockHttpClient;
 
-    #[tokio::test]
-    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
-    async fn azure_arc_client_id() {
-        run_arc_test(Some(ManagedIdentityCredentialOptions {
-            user_assigned_id: Some(UserAssignedId::ClientId("expected client ID".to_string())),
+        // Only IMDS_ENDPOINT set (no IDENTITY_ENDPOINT) -> should detect Azure Arc and use default endpoint
+        let env = Env::from(&[(IMDS_ENDPOINT, "http://localhost:40342")][..]);
+
+        // Verify detection picks Azure Arc
+        assert!(matches!(get_source(&env), ManagedIdentitySource::AzureArc));
+
+        // Prepare challenge file
+        let challenge_token = "arc-imds-only-token";
+        let challenge_file = NamedTempFile::new().unwrap();
+        writeln!(&challenge_file, "{}", challenge_token).unwrap();
+        let challenge_file_path = challenge_file.path().to_string_lossy().to_string();
+
+        // Expiration
+        let expires_on = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = request_count.clone();
+
+        let mock_client = MockHttpClient::new(move |req: &CoreRequest| {
+            let request_count = request_count_clone.clone();
+            let challenge_file_path = challenge_file_path.clone();
+            let challenge_token = challenge_token.to_string();
+
+            Box::pin(async move {
+                let count = request_count.fetch_add(1, Ordering::SeqCst);
+
+                // First request: expect no Authorization header, return challenge
+                if count == 0 {
+                    let mut headers = Headers::new();
+                    headers.insert(
+                        HeaderName::from_static("www-authenticate"),
+                        format!("Basic realm={}", challenge_file_path),
+                    );
+                    Ok(RawResponse::from_bytes(StatusCode::Unauthorized, headers, Bytes::new()))
+                } else {
+                    // Second request: must include Authorization header
+                    assert_eq!(
+                        req.headers()
+                            .get_str(&HeaderName::from_static("authorization"))
+                            .unwrap(),
+                        format!("Basic {}", challenge_token)
+                    );
+                    Ok(RawResponse::from_bytes(
+                        StatusCode::Ok,
+                        Headers::default(),
+                        Bytes::from(format!(
+                            r#"{{"access_token":"arc-detected-token","expires_on":"{}","resource":"{}","token_type":"Bearer"}}"#,
+                            expires_on, LIVE_TEST_RESOURCE
+                        )),
+                    ))
+                }
+            })
+        });
+
+        // Construct ManagedIdentityCredential with injected env + mock client
+        let cred = ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
+            credential_options: TokenCredentialOptions {
+                env: env.clone(),
+                http_client: Arc::new(mock_client),
+                ..Default::default()
+            },
             ..Default::default()
         }))
-        .await;
+        .expect("credential");
+
+        let token = cred.get_token(LIVE_TEST_SCOPES, None).await.expect("token");
+        assert_eq!(token.token.secret(), "arc-detected-token");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        // Second call should use cache (still 2 requests)
+        let token2 = cred.get_token(LIVE_TEST_SCOPES, None).await.expect("cached token");
+        assert_eq!(token2.token.secret(), "arc-detected-token");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
-    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
-    async fn azure_arc_object_id() {
-        run_arc_test(Some(ManagedIdentityCredentialOptions {
-            user_assigned_id: Some(UserAssignedId::ObjectId("expected object ID".to_string())),
-            ..Default::default()
-        }))
-        .await;
-    }
 
-    #[tokio::test]
-    #[ignore = "Needs update for new Azure Arc challenge-response flow"]
-    async fn azure_arc_resource_id() {
-        run_arc_test(Some(ManagedIdentityCredentialOptions {
-            user_assigned_id: Some(UserAssignedId::ResourceId(
-                "expected resource ID".to_string(),
-            )),
-            ..Default::default()
-        }))
-        .await;
-    }
+
 
     #[test]
     fn azure_ml() {

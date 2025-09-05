@@ -45,6 +45,7 @@ pub use process::{new_executor, Executor};
 pub use workload_identity_credential::*;
 
 pub(crate) use app_service_managed_identity_credential::*;
+pub use azure_arc_managed_identity_credential::AzureArcManagedIdentityCredential;
 pub(crate) use azure_arc_managed_identity_credential::*;
 pub(crate) use cache::TokenCache;
 pub(crate) use imds_managed_identity_credential::*;
