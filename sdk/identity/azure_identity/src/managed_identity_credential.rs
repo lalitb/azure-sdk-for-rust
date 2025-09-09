@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::{
-    env::Env, AppServiceManagedIdentityCredential, ImdsId, TokenCredentialOptions,
-    VirtualMachineManagedIdentityCredential,
+    env::Env, AppServiceManagedIdentityCredential, AzureArcManagedIdentityCredential, ImdsId,
+    TokenCredentialOptions, VirtualMachineManagedIdentityCredential,
 };
 use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
 use std::sync::Arc;
@@ -64,6 +64,16 @@ impl ManagedIdentityCredential {
             }
             ManagedIdentitySource::Imds => {
                 VirtualMachineManagedIdentityCredential::new(id, options.credential_options)?
+            }
+            ManagedIdentitySource::AzureArc => {
+                // Azure Arc does not support user-assigned managed identities (MSAL parity)
+                if !matches!(id, ImdsId::SystemAssigned) {
+                    return Err(azure_core::Error::with_message(
+                        azure_core::error::ErrorKind::Credential,
+                        || "Azure Arc doesn't support user-assigned managed identities".to_string(),
+                    ));
+                }
+                AzureArcManagedIdentityCredential::new(options.credential_options)?
             }
             _ => {
                 return Err(azure_core::Error::with_message(
@@ -389,15 +399,53 @@ mod tests {
     }
 
     #[test]
-    fn arc() {
-        run_unsupported_source_test(
-            Env::from(
-                &[
-                    (IDENTITY_ENDPOINT, "http://localhost"),
-                    (IMDS_ENDPOINT, "..."),
-                ][..],
-            ),
-            ManagedIdentitySource::AzureArc,
+    fn arc_user_assigned_not_supported() {
+        let env = Env::from(
+            &[
+                (IDENTITY_ENDPOINT, "http://localhost"),
+                (IMDS_ENDPOINT, "..."),
+            ][..],
+        );
+        // Detection should pick AzureArc
+        assert!(
+            matches!(get_source(&env), ManagedIdentitySource::AzureArc),
+            "Expected AzureArc source"
+        );
+        let result = ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
+            credential_options: TokenCredentialOptions {
+                env: env.clone(),
+                ..Default::default()
+            },
+            user_assigned_id: Some(UserAssignedId::ClientId("client-id".to_string())),
+        }));
+        assert!(
+            matches!(result, Err(ref e) if *e.kind() == azure_core::error::ErrorKind::Credential),
+            "Expected constructor error for user-assigned on Azure Arc"
+        );
+    }
+
+    #[test]
+    fn arc_system_assigned_supported() {
+        let env = Env::from(
+            &[
+                (IDENTITY_ENDPOINT, "http://localhost"),
+                (IMDS_ENDPOINT, "..."),
+            ][..],
+        );
+        assert!(
+            matches!(get_source(&env), ManagedIdentitySource::AzureArc),
+            "Expected AzureArc source"
+        );
+        let result = ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
+            credential_options: TokenCredentialOptions {
+                env,
+                ..Default::default()
+            },
+            user_assigned_id: None,
+        }));
+        assert!(
+            result.is_ok(),
+            "Expected system assigned Azure Arc credential to construct"
         );
     }
 

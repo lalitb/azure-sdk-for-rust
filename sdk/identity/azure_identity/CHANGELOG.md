@@ -4,6 +4,8 @@
 
 ### Features Added
 
+- Added Azure Arc managed identity support to `ManagedIdentityCredential` (system-assigned only). Implements two-step challenge (401 + secret file path) per Azure Arc protocol, mirroring MSAL Go behavior. User-assigned identities remain unsupported on Azure Arc.
+
 ### Breaking Changes
 
 - Replaced `DefaultAzureCredential` with `DeveloperToolsCredential`. This new type is excluded from WASM32 builds because it can't authenticate in a WASM runtime environment; however, neither could `DefaultAzureCredential`, which wasn't properly excluded.
